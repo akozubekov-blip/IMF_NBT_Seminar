@@ -1,4 +1,6 @@
 from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -141,26 +143,6 @@ def plot_chart(df, x_col, y_col, title, color_col="BANK_NAME"):
     )
 
     return fig
-
-    df = df.copy()
-
-    rate_map = dict(
-        zip(
-            exchange_rates["VAL_CODE"].astype(str).str.upper(),
-            exchange_rates["USD_RATE"],
-        )
-    )
-
-    val_code = df["VAL"].astype("string").str.strip().str.upper()
-    val_name = df["VAL_NAME"].astype("string").str.strip().str.upper()
-
-    df["USD_RATE"] = val_code.map(rate_map)
-    df["USD_RATE"] = df["USD_RATE"].fillna(val_name.map(rate_map))
-
-    df["POKUPK_USD"] = df["POKUPK"] * df["USD_RATE"]
-    df["PRODANO_USD"] = df["PRODANO"] * df["USD_RATE"]
-
-    return df
 
 
 # =================================================
@@ -388,7 +370,6 @@ if not currency_options:
 # 0. Exchange rate dynamics
 # =================================================
 if structure_option == "Динамика обменных курсов":
-    import numpy as np
 
     st.title(":chart_with_upwards_trend: Динамика обменных курсов")
 
@@ -947,7 +928,6 @@ elif structure_option == "Валютный рынок в разрезе Банк
 #    separated for NonCash and Cash
 # =================================================
 else:
-    import numpy as np
 
     st.title(":currency_exchange: Индикаторы валютного рынка")
 
@@ -983,6 +963,16 @@ else:
             indicator_df["PRODANO"],
             errors="coerce",
         ).fillna(0)
+
+        # Exchange-rate columns for bid-ask spread calculation.
+        for rate_column in ["KUR_POK", "KUR_PR"]:
+            if rate_column in df.columns:
+                indicator_df[rate_column] = pd.to_numeric(
+                    df[rate_column],
+                    errors="coerce",
+                ).fillna(0)
+            else:
+                indicator_df[rate_column] = 0
 
         # Swap columns exist only in non-cash data.
         # For cash data they are added as zero so the function stays universal.
@@ -1142,127 +1132,203 @@ else:
 
         return indicators
 
-
     def calculate_additional_currency_indicators(df_indicators, rolling_window=7):
-        # -------------------------------------------------
-        # Daily average transaction size and transaction count
-        # by currency
-        # -------------------------------------------------
-        df_currency_daily = (
-            df_indicators
-            .groupby(["DATVAL", "VAL_NAME"], as_index=False)
-            .agg(
-                TOTAL_DAILY_TURNOVER=("TOTAL_DAILY_TURNOVER", "sum"),
-                TRANSACTION_COUNT=("TRANSACTION_COUNT", "sum"),
+            # -------------------------------------------------
+            # Daily average transaction size and transaction count
+            # by currency
+            # -------------------------------------------------
+            df_currency_daily = (
+                df_indicators
+                .groupby(["DATVAL", "VAL_NAME"], as_index=False)
+                .agg(
+                    TOTAL_DAILY_TURNOVER=("TOTAL_DAILY_TURNOVER", "sum"),
+                    TRANSACTION_COUNT=("TRANSACTION_COUNT", "sum"),
+                )
             )
+
+            df_currency_daily["AVG_TRANSACTION_SIZE"] = np.where(
+                df_currency_daily["TRANSACTION_COUNT"] > 0,
+                df_currency_daily["TOTAL_DAILY_TURNOVER"]
+                / df_currency_daily["TRANSACTION_COUNT"],
+                0,
+            )
+
+            df_currency_daily = df_currency_daily.sort_values(
+                [
+                    "VAL_NAME",
+                    "DATVAL",
+                ]
+            )
+
+            df_currency_daily["AVG_TRANSACTION_SIZE_7D"] = (
+                df_currency_daily
+                .groupby("VAL_NAME")["AVG_TRANSACTION_SIZE"]
+                .transform(
+                    lambda x: x.rolling(
+                        window=rolling_window,
+                        min_periods=1,
+                    ).mean()
+                )
+            )
+
+            # -------------------------------------------------
+            # Concentration indicator, HHI
+            # Calculated across banks for each currency and day.
+            # -------------------------------------------------
+            df_bank_currency_daily = (
+                df_indicators
+                .groupby(["DATVAL", "VAL_NAME", "BANK_NAME"], as_index=False)
+                .agg(
+                    BANK_DAILY_TURNOVER=("TOTAL_DAILY_TURNOVER", "sum"),
+                )
+            )
+
+            df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"] = (
+                df_bank_currency_daily
+                .groupby(["DATVAL", "VAL_NAME"])["BANK_DAILY_TURNOVER"]
+                .transform("sum")
+            )
+
+            df_bank_currency_daily["BANK_SHARE"] = np.where(
+                df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"] > 0,
+                df_bank_currency_daily["BANK_DAILY_TURNOVER"]
+                / df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"],
+                0,
+            )
+
+            df_bank_currency_daily["BANK_SHARE_SQUARED"] = (
+                    df_bank_currency_daily["BANK_SHARE"] ** 2
+            )
+
+            df_concentration = (
+                df_bank_currency_daily
+                .groupby(["DATVAL", "VAL_NAME"], as_index=False)
+                .agg(
+                    CONCENTRATION_HHI=("BANK_SHARE_SQUARED", "sum"),
+                )
+            )
+
+            df_concentration["CONCENTRATION_HHI"] = (
+                    df_concentration["CONCENTRATION_HHI"] * 10000
+            )
+
+            df_additional_indicators = df_currency_daily.merge(
+                df_concentration,
+                on=["DATVAL", "VAL_NAME"],
+                how="left",
+            )
+
+            df_additional_indicators["CONCENTRATION_HHI"] = (
+                df_additional_indicators["CONCENTRATION_HHI"]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0)
+            )
+
+            return df_additional_indicators
+
+
+    def weighted_average_indicator_rate(group, rate_column, weight_column):
+        rates = pd.to_numeric(
+            group[rate_column],
+            errors="coerce",
         )
 
-        df_currency_daily["AVG_TRANSACTION_SIZE"] = np.where(
-            df_currency_daily["TRANSACTION_COUNT"] > 0,
-            df_currency_daily["TOTAL_DAILY_TURNOVER"]
-            / df_currency_daily["TRANSACTION_COUNT"],
-            0,
+        weights = pd.to_numeric(
+            group[weight_column],
+            errors="coerce",
+        ).fillna(0).abs()
+
+        valid_mask = (
+                rates.notna()
+                & weights.notna()
+                & (weights > 0)
+                & (rates > 0)
         )
 
-        df_currency_daily = df_currency_daily.sort_values(
+        if valid_mask.any():
+            return np.average(
+                rates.loc[valid_mask],
+                weights=weights.loc[valid_mask],
+            )
+
+        valid_rates = rates[
+            rates.notna()
+            & (rates > 0)
+            ]
+
+        if not valid_rates.empty:
+            return valid_rates.mean()
+
+        return np.nan
+
+
+    def calculate_bid_ask_spread_indicators(df_source):
+        group_columns = [
+            "DATVAL_DAY",
+            "VAL_NAME",
+        ]
+
+        spread_rows = []
+
+        for group_values, group_df in df_source.groupby(group_columns):
+            datval_day, val_name = group_values
+
+            kur_pok_weighted = weighted_average_indicator_rate(
+                group_df,
+                "KUR_POK",
+                "POKUPK",
+            )
+
+            kur_pr_weighted = weighted_average_indicator_rate(
+                group_df,
+                "KUR_PR",
+                "PRODANO",
+            )
+
+            bid_ask_spread = kur_pr_weighted - kur_pok_weighted
+
+            bid_ask_spread_pct = (
+                bid_ask_spread / kur_pok_weighted * 100
+                if pd.notna(kur_pok_weighted) and kur_pok_weighted > 0
+                else np.nan
+            )
+
+            spread_rows.append(
+                {
+                    "DATVAL": datval_day,
+                    "VAL_NAME": val_name,
+                    "KUR_POK_WEIGHTED": kur_pok_weighted,
+                    "KUR_PR_WEIGHTED": kur_pr_weighted,
+                    "BID_ASK_SPREAD": bid_ask_spread,
+                    "BID_ASK_SPREAD_PCT": bid_ask_spread_pct,
+                }
+            )
+
+        df_spread = pd.DataFrame(spread_rows)
+
+        if df_spread.empty:
+            return df_spread
+
+        df_spread["BID_ASK_SPREAD"] = (
+            df_spread["BID_ASK_SPREAD"]
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+        df_spread["BID_ASK_SPREAD_PCT"] = (
+            df_spread["BID_ASK_SPREAD_PCT"]
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+        return df_spread.sort_values(
             [
                 "VAL_NAME",
                 "DATVAL",
             ]
         )
 
-        df_currency_daily["AVG_TRANSACTION_SIZE_7D"] = (
-            df_currency_daily
-            .groupby("VAL_NAME")["AVG_TRANSACTION_SIZE"]
-            .transform(
-                lambda x: x.rolling(
-                    window=rolling_window,
-                    min_periods=1,
-                ).mean()
-            )
-        )
-
-        # -------------------------------------------------
-        # Concentration indicator, HHI
-        # Calculated across banks for each currency and day.
-        #
-        # HHI = sum(bank_share^2) * 10000
-        # 10000 means one bank has 100% of turnover.
-        # -------------------------------------------------
-        df_bank_currency_daily = (
-            df_indicators
-            .groupby(["DATVAL", "VAL_NAME", "BANK_NAME"], as_index=False)
-            .agg(
-                BANK_DAILY_TURNOVER=("TOTAL_DAILY_TURNOVER", "sum"),
-            )
-        )
-
-        df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"] = (
-            df_bank_currency_daily
-            .groupby(["DATVAL", "VAL_NAME"])["BANK_DAILY_TURNOVER"]
-            .transform("sum")
-        )
-
-        df_bank_currency_daily["BANK_SHARE"] = np.where(
-            df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"] > 0,
-            df_bank_currency_daily["BANK_DAILY_TURNOVER"]
-            / df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"],
-            0,
-        )
-
-        df_bank_currency_daily["BANK_SHARE_SQUARED"] = (
-                df_bank_currency_daily["BANK_SHARE"] ** 2
-        )
-
-        df_concentration = (
-            df_bank_currency_daily
-            .groupby(["DATVAL", "VAL_NAME"], as_index=False)
-            .agg(
-                CONCENTRATION_HHI=("BANK_SHARE_SQUARED", "sum"),
-            )
-        )
-
-        df_concentration["CONCENTRATION_HHI"] = (
-                df_concentration["CONCENTRATION_HHI"] * 10000
-        )
-
-        df_additional_indicators = df_currency_daily.merge(
-            df_concentration,
-            on=["DATVAL", "VAL_NAME"],
-            how="left",
-        )
-
-        df_additional_indicators["CONCENTRATION_HHI"] = (
-            df_additional_indicators["CONCENTRATION_HHI"]
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(0)
-        )
-
-        return df_additional_indicators
-
-
     def format_number(value):
         return f"{value:,.2f}"
 
-
-    def move_usd_to_front(options):
-        options = list(options)
-
-        usd_option = next(
-            (
-                option
-                for option in options
-                if str(option).strip().upper() == "USD"
-            ),
-            None,
-        )
-
-        if usd_option is None:
-            return options
-
-        return [usd_option] + [
-            option for option in options if option != usd_option
-        ]
 
 
     def render_indicator_section(
@@ -1379,6 +1445,10 @@ else:
         df_additional_indicators = calculate_additional_currency_indicators(
             df_indicators,
             rolling_window=ROLLING_VOL_WINDOW,
+        )
+
+        df_bid_ask_spread = calculate_bid_ask_spread_indicators(
+            df_source
         )
 
         show_swap_tab = section_title == "Безналичные операции"
@@ -1634,6 +1704,52 @@ else:
                 unsafe_allow_html=True,
             )
 
+            st.markdown("---")
+
+            fig_bid_ask_spread = px.line(
+                df_bid_ask_spread.dropna(subset=["BID_ASK_SPREAD"]),
+                x="DATVAL",
+                y="BID_ASK_SPREAD",
+                color="VAL_NAME",
+                markers=True,
+                title="<b>Bid-ask spread: курс продажи минус курс покупки</b>",
+                template="plotly_white",
+            )
+
+            fig_bid_ask_spread.update_layout(
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=False),
+                yaxis_title="Bid-ask spread",
+                legend_title_text="Валюта",
+            )
+
+            st.plotly_chart(
+                fig_bid_ask_spread,
+                use_container_width=True,
+            )
+
+            fig_bid_ask_spread_pct = px.line(
+                df_bid_ask_spread.dropna(subset=["BID_ASK_SPREAD_PCT"]),
+                x="DATVAL",
+                y="BID_ASK_SPREAD_PCT",
+                color="VAL_NAME",
+                markers=True,
+                title="<b>Bid-ask spread, % от курса покупки</b>",
+                template="plotly_white",
+            )
+
+            fig_bid_ask_spread_pct.update_layout(
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=False),
+                yaxis_title="Bid-ask spread, %",
+                legend_title_text="Валюта",
+            )
+
+            st.plotly_chart(
+                fig_bid_ask_spread_pct,
+                use_container_width=True,
+            )
+
         # -------------------------------------------------
         # Swap operation charts
         # Only for non-cash operations
@@ -1742,8 +1858,9 @@ else:
         df_fx_base["VAL_NAME"].dropna().unique()
     )
 
-    indicator_currency_options = move_usd_to_front(
-        indicator_currency_options
+    indicator_currency_options = move_option_to_front(
+        indicator_currency_options,
+        "USD",
     )
 
     default_currencies = (
