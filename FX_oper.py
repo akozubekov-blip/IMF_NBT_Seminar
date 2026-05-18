@@ -1712,7 +1712,7 @@ else:
                 y="BID_ASK_SPREAD",
                 color="VAL_NAME",
                 markers=True,
-                title="<b>Bid-ask spread: курс продажи минус курс покупки</b>",
+                title="<b>Bid-ask spread - курс продажи минус курс покупки</b>",
                 template="plotly_white",
             )
 
@@ -1734,7 +1734,7 @@ else:
                 y="BID_ASK_SPREAD_PCT",
                 color="VAL_NAME",
                 markers=True,
-                title="<b>Bid-ask spread, % от курса покупки</b>",
+                title="<b>Bid-ask spread - % от курса покупки</b>",
                 template="plotly_white",
             )
 
