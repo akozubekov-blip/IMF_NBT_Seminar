@@ -1022,13 +1022,29 @@ else:
                 PRODANO_DAILY_TURNOVER=("PRODANO", "sum"),
                 POS_SVOP1_DAILY_TURNOVER=("POS_SVOP1", "sum"),
                 POS_SVOP2_DAILY_TURNOVER=("POS_SVOP2", "sum"),
+
+                # Number of purchase/sale transaction records
+                POKUPK_TRANSACTION_COUNT=("POKUPK", lambda x: (x.abs() > 0).sum()),
+                PRODANO_TRANSACTION_COUNT=("PRODANO", lambda x: (x.abs() > 0).sum()),
+
                 OBSERVATIONS=("POKUPK", "count"),
             )
         )
 
         indicators["TOTAL_DAILY_TURNOVER"] = (
-            indicators["POKUPK_DAILY_TURNOVER"]
-            + indicators["PRODANO_DAILY_TURNOVER"]
+                indicators["POKUPK_DAILY_TURNOVER"]
+                + indicators["PRODANO_DAILY_TURNOVER"]
+        )
+
+        indicators["TRANSACTION_COUNT"] = (
+                indicators["POKUPK_TRANSACTION_COUNT"]
+                + indicators["PRODANO_TRANSACTION_COUNT"]
+        )
+
+        indicators["AVG_TRANSACTION_SIZE"] = np.where(
+            indicators["TRANSACTION_COUNT"] > 0,
+            indicators["TOTAL_DAILY_TURNOVER"] / indicators["TRANSACTION_COUNT"],
+            0,
         )
 
         indicators = indicators.rename(
@@ -1085,11 +1101,11 @@ else:
             )
 
             group["POKUPK_7D_VOL_PCT"] = (
-                pokupk_rolling_std / pokupk_rolling_mean.abs() * 100
+                    pokupk_rolling_std / pokupk_rolling_mean.abs() * 100
             )
 
             group["PRODANO_7D_VOL_PCT"] = (
-                prodano_rolling_std / prodano_rolling_mean.abs() * 100
+                    prodano_rolling_std / prodano_rolling_mean.abs() * 100
             )
 
             group["POKUPK_7D_VOL_PCT"] = (
@@ -1109,11 +1125,11 @@ else:
         indicator_parts = []
 
         for _, group in indicators.groupby(
-            [
-                "BANK_NAME",
-                "VAL_NAME",
-            ],
-            sort=False,
+                [
+                    "BANK_NAME",
+                    "VAL_NAME",
+                ],
+                sort=False,
         ):
             indicator_parts.append(
                 add_rolling_volatility(group)
@@ -1125,6 +1141,104 @@ else:
         )
 
         return indicators
+
+
+    def calculate_additional_currency_indicators(df_indicators, rolling_window=7):
+        # -------------------------------------------------
+        # Daily average transaction size and transaction count
+        # by currency
+        # -------------------------------------------------
+        df_currency_daily = (
+            df_indicators
+            .groupby(["DATVAL", "VAL_NAME"], as_index=False)
+            .agg(
+                TOTAL_DAILY_TURNOVER=("TOTAL_DAILY_TURNOVER", "sum"),
+                TRANSACTION_COUNT=("TRANSACTION_COUNT", "sum"),
+            )
+        )
+
+        df_currency_daily["AVG_TRANSACTION_SIZE"] = np.where(
+            df_currency_daily["TRANSACTION_COUNT"] > 0,
+            df_currency_daily["TOTAL_DAILY_TURNOVER"]
+            / df_currency_daily["TRANSACTION_COUNT"],
+            0,
+        )
+
+        df_currency_daily = df_currency_daily.sort_values(
+            [
+                "VAL_NAME",
+                "DATVAL",
+            ]
+        )
+
+        df_currency_daily["AVG_TRANSACTION_SIZE_7D"] = (
+            df_currency_daily
+            .groupby("VAL_NAME")["AVG_TRANSACTION_SIZE"]
+            .transform(
+                lambda x: x.rolling(
+                    window=rolling_window,
+                    min_periods=1,
+                ).mean()
+            )
+        )
+
+        # -------------------------------------------------
+        # Concentration indicator, HHI
+        # Calculated across banks for each currency and day.
+        #
+        # HHI = sum(bank_share^2) * 10000
+        # 10000 means one bank has 100% of turnover.
+        # -------------------------------------------------
+        df_bank_currency_daily = (
+            df_indicators
+            .groupby(["DATVAL", "VAL_NAME", "BANK_NAME"], as_index=False)
+            .agg(
+                BANK_DAILY_TURNOVER=("TOTAL_DAILY_TURNOVER", "sum"),
+            )
+        )
+
+        df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"] = (
+            df_bank_currency_daily
+            .groupby(["DATVAL", "VAL_NAME"])["BANK_DAILY_TURNOVER"]
+            .transform("sum")
+        )
+
+        df_bank_currency_daily["BANK_SHARE"] = np.where(
+            df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"] > 0,
+            df_bank_currency_daily["BANK_DAILY_TURNOVER"]
+            / df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"],
+            0,
+        )
+
+        df_bank_currency_daily["BANK_SHARE_SQUARED"] = (
+                df_bank_currency_daily["BANK_SHARE"] ** 2
+        )
+
+        df_concentration = (
+            df_bank_currency_daily
+            .groupby(["DATVAL", "VAL_NAME"], as_index=False)
+            .agg(
+                CONCENTRATION_HHI=("BANK_SHARE_SQUARED", "sum"),
+            )
+        )
+
+        df_concentration["CONCENTRATION_HHI"] = (
+                df_concentration["CONCENTRATION_HHI"] * 10000
+        )
+
+        df_additional_indicators = df_currency_daily.merge(
+            df_concentration,
+            on=["DATVAL", "VAL_NAME"],
+            how="left",
+        )
+
+        df_additional_indicators["CONCENTRATION_HHI"] = (
+            df_additional_indicators["CONCENTRATION_HHI"]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+        )
+
+        return df_additional_indicators
 
 
     def format_number(value):
@@ -1262,21 +1376,28 @@ else:
             )
         )
 
+        df_additional_indicators = calculate_additional_currency_indicators(
+            df_indicators,
+            rolling_window=ROLLING_VOL_WINDOW,
+        )
+
         show_swap_tab = section_title == "Безналичные операции"
 
         if show_swap_tab:
-            turnover_tab, volatility_tab, swap_tab = st.tabs(
+            turnover_tab, volatility_tab, additional_tab, swap_tab = st.tabs(
                 [
                     "Ежедневный оборот",
                     "7-дневная волатильность",
+                    "Дополнительные индикаторы",
                     "СВОП-операции",
                 ]
             )
         else:
-            turnover_tab, volatility_tab = st.tabs(
+            turnover_tab, volatility_tab, additional_tab = st.tabs(
                 [
                     "Ежедневный оборот",
                     "7-дневная волатильность",
+                    "Дополнительные индикаторы",
                 ]
             )
 
@@ -1400,6 +1521,80 @@ else:
                     fig_prodano_volatility,
                     use_container_width=True,
                 )
+
+        # -------------------------------------------------
+        # Additional FX market indicators
+        # -------------------------------------------------
+        with additional_tab:
+            additional_col1, additional_col2 = st.columns(2)
+
+            with additional_col1:
+                fig_avg_transaction_size = px.line(
+                    df_additional_indicators,
+                    x="DATVAL",
+                    y="AVG_TRANSACTION_SIZE_7D",
+                    color="VAL_NAME",
+                    markers=True,
+                    title="<b>7-дневный средний размер валютной операции</b>",
+                    template="plotly_white",
+                )
+
+                fig_avg_transaction_size.update_layout(
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showgrid=False),
+                    yaxis_title="Средний размер операции",
+                    legend_title_text="Валюта",
+                )
+
+                st.plotly_chart(
+                    fig_avg_transaction_size,
+                    use_container_width=True,
+                )
+
+            with additional_col2:
+                fig_transaction_count = px.bar(
+                    df_additional_indicators,
+                    x="DATVAL",
+                    y="TRANSACTION_COUNT",
+                    color="VAL_NAME",
+                    orientation="v",
+                    title="<b>Количество валютных операций</b>",
+                    template="plotly_white",
+                )
+
+                fig_transaction_count.update_layout(
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showgrid=False),
+                    yaxis_title="Количество операций",
+                    legend_title_text="Валюта",
+                )
+
+                st.plotly_chart(
+                    fig_transaction_count,
+                    use_container_width=True,
+                )
+
+            fig_concentration = px.line(
+                df_additional_indicators,
+                x="DATVAL",
+                y="CONCENTRATION_HHI",
+                color="VAL_NAME",
+                markers=True,
+                title="<b>Индикатор концентрации валютного рынка, HHI</b>",
+                template="plotly_white",
+            )
+
+            fig_concentration.update_layout(
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=False),
+                yaxis_title="HHI",
+                legend_title_text="Валюта",
+            )
+
+            st.plotly_chart(
+                fig_concentration,
+                use_container_width=True,
+            )
 
         # -------------------------------------------------
         # Swap operation charts
