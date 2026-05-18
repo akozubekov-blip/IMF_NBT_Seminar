@@ -638,16 +638,35 @@ if structure_option == "Динамика обменных курсов":
         df_rates_base["VAL_NAME"].dropna().unique()
     )
 
+    # Put USD and RUB at the beginning of the currency list
+    rate_currency_options = move_option_to_front(
+        rate_currency_options,
+        "RUB",
+    )
+
     rate_currency_options = move_option_to_front(
         rate_currency_options,
         "USD",
     )
 
-    default_rate_currencies = (
-        ["USD"]
-        if "USD" in rate_currency_options
-        else rate_currency_options[:1]
-    )
+    # Select USD and RUB by default if they exist in the data
+    default_rate_currencies = []
+
+    for preferred_currency in ["USD", "RUB"]:
+        matched_currency = next(
+            (
+                currency
+                for currency in rate_currency_options
+                if str(currency).strip().upper() == preferred_currency
+            ),
+            None,
+        )
+
+        if matched_currency is not None:
+            default_rate_currencies.append(matched_currency)
+
+    if not default_rate_currencies:
+        default_rate_currencies = rate_currency_options[:1]
 
     selected_rate_banks = st.sidebar.multiselect(
         "Выберите Банк:",
@@ -1227,6 +1246,106 @@ else:
             return df_additional_indicators
 
 
+    def calculate_market_concentration_indicators(df_indicators):
+        # -------------------------------------------------
+        # Market concentration indicators:
+        # HHI and Top-5 bank share
+        # Calculated by day and currency
+        # -------------------------------------------------
+        df_bank_currency_daily = (
+            df_indicators
+            .groupby(["DATVAL", "VAL_NAME", "BANK_NAME"], as_index=False)
+            .agg(
+                BANK_DAILY_TURNOVER=("TOTAL_DAILY_TURNOVER", "sum"),
+            )
+        )
+
+        df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"] = (
+            df_bank_currency_daily
+            .groupby(["DATVAL", "VAL_NAME"])["BANK_DAILY_TURNOVER"]
+            .transform("sum")
+        )
+
+        df_bank_currency_daily["BANK_SHARE"] = np.where(
+            df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"] > 0,
+            df_bank_currency_daily["BANK_DAILY_TURNOVER"]
+            / df_bank_currency_daily["CURRENCY_DAILY_TURNOVER"],
+            0,
+        )
+
+        df_bank_currency_daily["BANK_SHARE_SQUARED"] = (
+                df_bank_currency_daily["BANK_SHARE"] ** 2
+        )
+
+        # HHI = sum of squared bank shares * 10000
+        df_hhi = (
+            df_bank_currency_daily
+            .groupby(["DATVAL", "VAL_NAME"], as_index=False)
+            .agg(
+                CONCENTRATION_HHI=("BANK_SHARE_SQUARED", "sum"),
+            )
+        )
+
+        df_hhi["CONCENTRATION_HHI"] = (
+                df_hhi["CONCENTRATION_HHI"] * 10000
+        )
+
+        # TOP_5_SHARE = turnover of top 5 banks / total turnover * 100
+        df_top_5 = (
+            df_bank_currency_daily
+            .sort_values(
+                ["DATVAL", "VAL_NAME", "BANK_DAILY_TURNOVER"],
+                ascending=[True, True, False],
+            )
+            .groupby(["DATVAL", "VAL_NAME"])
+            .head(5)
+            .groupby(["DATVAL", "VAL_NAME"], as_index=False)
+            .agg(
+                TOP_5_TURNOVER=("BANK_DAILY_TURNOVER", "sum"),
+                CURRENCY_DAILY_TURNOVER=("CURRENCY_DAILY_TURNOVER", "first"),
+            )
+        )
+
+        df_top_5["TOP_5_SHARE"] = np.where(
+            df_top_5["CURRENCY_DAILY_TURNOVER"] > 0,
+            df_top_5["TOP_5_TURNOVER"]
+            / df_top_5["CURRENCY_DAILY_TURNOVER"]
+            * 100,
+            0,
+        )
+
+        df_concentration = df_hhi.merge(
+            df_top_5[
+                [
+                    "DATVAL",
+                    "VAL_NAME",
+                    "TOP_5_SHARE",
+                ]
+            ],
+            on=["DATVAL", "VAL_NAME"],
+            how="left",
+        )
+
+        df_concentration["CONCENTRATION_HHI"] = (
+            df_concentration["CONCENTRATION_HHI"]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+        )
+
+        df_concentration["TOP_5_SHARE"] = (
+            df_concentration["TOP_5_SHARE"]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+        )
+
+        return df_concentration.sort_values(
+            [
+                "VAL_NAME",
+                "DATVAL",
+            ]
+        )
+
+
     def weighted_average_indicator_rate(group, rate_column, weight_column):
         rates = pd.to_numeric(
             group[rate_column],
@@ -1285,11 +1404,22 @@ else:
                 "PRODANO",
             )
 
+            total_daily_turnover = (
+                    group_df["POKUPK"].sum()
+                    + group_df["PRODANO"].sum()
+            )
+
             bid_ask_spread = kur_pr_weighted - kur_pok_weighted
 
             bid_ask_spread_pct = (
                 bid_ask_spread / kur_pok_weighted * 100
                 if pd.notna(kur_pok_weighted) and kur_pok_weighted > 0
+                else np.nan
+            )
+
+            liquidity_score = (
+                total_daily_turnover / bid_ask_spread
+                if pd.notna(bid_ask_spread) and bid_ask_spread > 0
                 else np.nan
             )
 
@@ -1299,8 +1429,10 @@ else:
                     "VAL_NAME": val_name,
                     "KUR_POK_WEIGHTED": kur_pok_weighted,
                     "KUR_PR_WEIGHTED": kur_pr_weighted,
+                    "TOTAL_DAILY_TURNOVER": total_daily_turnover,
                     "BID_ASK_SPREAD": bid_ask_spread,
                     "BID_ASK_SPREAD_PCT": bid_ask_spread_pct,
+                    "LIQUIDITY_SCORE": liquidity_score,
                 }
             )
 
@@ -1309,15 +1441,17 @@ else:
         if df_spread.empty:
             return df_spread
 
-        df_spread["BID_ASK_SPREAD"] = (
-            df_spread["BID_ASK_SPREAD"]
-            .replace([np.inf, -np.inf], np.nan)
-        )
+        columns_to_clean = [
+            "BID_ASK_SPREAD",
+            "BID_ASK_SPREAD_PCT",
+            "LIQUIDITY_SCORE",
+        ]
 
-        df_spread["BID_ASK_SPREAD_PCT"] = (
-            df_spread["BID_ASK_SPREAD_PCT"]
-            .replace([np.inf, -np.inf], np.nan)
-        )
+        for column in columns_to_clean:
+            df_spread[column] = (
+                df_spread[column]
+                .replace([np.inf, -np.inf], np.nan)
+            )
 
         return df_spread.sort_values(
             [
@@ -1447,6 +1581,10 @@ else:
             rolling_window=ROLLING_VOL_WINDOW,
         )
 
+        df_market_concentration = calculate_market_concentration_indicators(
+            df_indicators
+        )
+
         df_bid_ask_spread = calculate_bid_ask_spread_indicators(
             df_source
         )
@@ -1454,19 +1592,21 @@ else:
         show_swap_tab = section_title == "Безналичные операции"
 
         if show_swap_tab:
-            turnover_tab, volatility_tab, additional_tab, swap_tab = st.tabs(
+            turnover_tab, volatility_tab, concentration_tab, additional_tab, swap_tab = st.tabs(
                 [
                     "Ежедневный оборот",
                     "7-дневная волатильность",
+                    "Концентрация валютного рынка",
                     "Дополнительные индикаторы",
                     "СВОП-операции",
                 ]
             )
         else:
-            turnover_tab, volatility_tab, additional_tab = st.tabs(
+            turnover_tab, volatility_tab, concentration_tab, additional_tab = st.tabs(
                 [
                     "Ежедневный оборот",
                     "7-дневная волатильность",
+                    "Концентрация валютного рынка",
                     "Дополнительные индикаторы",
                 ]
             )
@@ -1593,59 +1733,11 @@ else:
                 )
 
         # -------------------------------------------------
-        # Additional FX market indicators
+        # Market concentration indicators
         # -------------------------------------------------
-        with additional_tab:
-            additional_col1, additional_col2 = st.columns(2)
-
-            with additional_col1:
-                fig_avg_transaction_size = px.line(
-                    df_additional_indicators,
-                    x="DATVAL",
-                    y="AVG_TRANSACTION_SIZE_7D",
-                    color="VAL_NAME",
-                    markers=True,
-                    title="<b>7-дневный средний размер валютной операции</b>",
-                    template="plotly_white",
-                )
-
-                fig_avg_transaction_size.update_layout(
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    xaxis=dict(showgrid=False),
-                    yaxis_title="Средний размер операции",
-                    legend_title_text="Валюта",
-                )
-
-                st.plotly_chart(
-                    fig_avg_transaction_size,
-                    use_container_width=True,
-                )
-
-            with additional_col2:
-                fig_transaction_count = px.bar(
-                    df_additional_indicators,
-                    x="DATVAL",
-                    y="TRANSACTION_COUNT",
-                    color="VAL_NAME",
-                    orientation="v",
-                    title="<b>Количество валютных операций</b>",
-                    template="plotly_white",
-                )
-
-                fig_transaction_count.update_layout(
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    xaxis=dict(showgrid=False),
-                    yaxis_title="Количество операций",
-                    legend_title_text="Валюта",
-                )
-
-                st.plotly_chart(
-                    fig_transaction_count,
-                    use_container_width=True,
-                )
-
+        with concentration_tab:
             fig_concentration = px.line(
-                df_additional_indicators,
+                df_market_concentration,
                 x="DATVAL",
                 y="CONCENTRATION_HHI",
                 color="VAL_NAME",
@@ -1706,6 +1798,82 @@ else:
 
             st.markdown("---")
 
+            fig_top_5_share = px.line(
+                df_market_concentration,
+                x="DATVAL",
+                y="TOP_5_SHARE",
+                color="VAL_NAME",
+                markers=True,
+                title="<b>Доля пяти крупнейших банков в обороте валютного рынка</b>",
+                template="plotly_white",
+            )
+
+            fig_top_5_share.update_layout(
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=False),
+                yaxis_title="Доля пяти крупнейших банков, %",
+                legend_title_text="Валюта",
+            )
+
+            st.plotly_chart(
+                fig_top_5_share,
+                use_container_width=True,
+            )
+
+        # -------------------------------------------------
+        # Additional FX market indicators
+        # -------------------------------------------------
+        with additional_tab:
+            additional_col1, additional_col2 = st.columns(2)
+
+            with additional_col1:
+                fig_avg_transaction_size = px.line(
+                    df_additional_indicators,
+                    x="DATVAL",
+                    y="AVG_TRANSACTION_SIZE_7D",
+                    color="VAL_NAME",
+                    markers=True,
+                    title="<b>7-дневный средний размер валютной операции</b>",
+                    template="plotly_white",
+                )
+
+                fig_avg_transaction_size.update_layout(
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showgrid=False),
+                    yaxis_title="Средний размер операции",
+                    legend_title_text="Валюта",
+                )
+
+                st.plotly_chart(
+                    fig_avg_transaction_size,
+                    use_container_width=True,
+                )
+
+            with additional_col2:
+                fig_transaction_count = px.bar(
+                    df_additional_indicators,
+                    x="DATVAL",
+                    y="TRANSACTION_COUNT",
+                    color="VAL_NAME",
+                    orientation="v",
+                    title="<b>Количество валютных операций</b>",
+                    template="plotly_white",
+                )
+
+                fig_transaction_count.update_layout(
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showgrid=False),
+                    yaxis_title="Количество операций",
+                    legend_title_text="Валюта",
+                )
+
+                st.plotly_chart(
+                    fig_transaction_count,
+                    use_container_width=True,
+                )
+
+            st.markdown("---")
+
             fig_bid_ask_spread = px.line(
                 df_bid_ask_spread.dropna(subset=["BID_ASK_SPREAD"]),
                 x="DATVAL",
@@ -1748,6 +1916,71 @@ else:
             st.plotly_chart(
                 fig_bid_ask_spread_pct,
                 use_container_width=True,
+            )
+
+            st.markdown("---")
+
+            fig_liquidity_score = px.line(
+                df_bid_ask_spread.dropna(subset=["LIQUIDITY_SCORE"]),
+                x="DATVAL",
+                y="LIQUIDITY_SCORE",
+                color="VAL_NAME",
+                markers=True,
+                title="<b>Индикатор ликвидности валютного рынка</b>",
+                template="plotly_white",
+            )
+
+            fig_liquidity_score.update_layout(
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=False),
+                yaxis_title="Индикатор ликвидности",
+                legend_title_text="Валюта",
+            )
+
+            st.plotly_chart(
+                fig_liquidity_score,
+                use_container_width=True,
+            )
+
+            st.markdown(
+                """
+                <div style="
+                    background-color: rgba(240, 242, 246, 0.08);
+                    border-left: 4px solid #4C78A8;
+                    padding: 14px 18px;
+                    border-radius: 6px;
+                    margin-top: 8px;
+                    margin-bottom: 18px;
+                    font-size: 0.95rem;
+                    line-height: 1.6;
+                ">
+                    <b>Индикатор ликвидности валютного рынка</b> показывает соотношение
+                    между ежедневным оборотом валютного рынка и величиной bid-ask spread.
+                    Он рассчитывается как:
+                    <br><br>
+                    <b>Индикатор ликвидности = Общий ежедневный оборот / Bid-ask spread</b>
+                    <br><br>
+                    Чем выше значение индикатора, тем выше ликвидность рынка: большой объем
+                    операций совершается при относительно низкой разнице между курсом покупки
+                    и курсом продажи.
+                    <br><br>
+                    Чем ниже значение индикатора, тем ниже ликвидность рынка: даже при наличии
+                    оборота сделки сопровождаются более широкой разницей между курсом покупки
+                    и курсом продажи, что может указывать
+                    на повышенные транзакционные издержки, ограниченную глубину рынка или
+                    рост рыночной неопределенности.
+                    <br><br>
+                    <b>Интерпретация:</b>
+                    <ul>
+                        <li><b>Рост индикатора</b> — улучшение ликвидности валютного рынка.</li>
+                        <li><b>Снижение индикатора</b> — ухудшение ликвидности валютного рынка.</li>
+                        <li><b>Резкое падение индикатора</b> может сигнализировать о стрессовой
+                        ситуации на рынке, снижении активности участников или расширении
+                        bid-ask spread.</li>
+                    </ul>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
         # -------------------------------------------------
